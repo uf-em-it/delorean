@@ -25,8 +25,8 @@ maxDayAttemptNotification=6
 SOURCES=("$HOME/Pictures" "$HOME/Documents" "$HOME/Downloads" "$HOME/Desktop")
 
 # Define destination directory
-DEST="/Volumes/SFA-All/User Data/$(whoami)/"
-# DEST="/Volumes/$(whoami)/SYSTEM/delorean/"
+#DEST="/Volumes/SFA-All/User Data/$(whoami)/"
+DEST="/Volumes/$(whoami)/SYSTEM/delorean/"
 mkdir -p "$DEST"
 
 # Log files
@@ -55,16 +55,19 @@ EXCLUDES=(
     --exclude='*-shm'
     --exclude='*-wal'
     --exclude='*.tmp'
-    --exclude='*.wav'
-    --exclude='*.aup3'
-    --exclude='*.mp3'
-    --exclude='*.m4a'
-    --exclude='*.mp4'
+#    --exclude='*.wav'
+#    --exclude='*.aup3'
+#    --exclude='*.mp3'
+#    --exclude='*.m4a'
+#    --exclude='*.mp4'
+#    --exclude='*.mov'
+#    --exclude='*.jpg'
     --exclude='*.dmg'
     --exclude='*.pkg'
     --exclude='*.iso'
-    --exclude='*.jpg'
-    --exclude='*.mov'
+    --exclude='*.app'
+    --exclude='*.pvm'
+    --exclude='*.pvmp'
 )
 
 # ----------------------------------------------------------------------
