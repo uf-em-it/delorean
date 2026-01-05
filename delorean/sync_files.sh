@@ -1,90 +1,184 @@
 #!/bin/bash
-
+# ----------------------------------------------------------------------
+# CLEANUP TRAP
 # Ensure child processes (rsync) are terminated when this script exits
-# When we receive SIGTERM/SIGINT, exit immediately without logging
+# ----------------------------------------------------------------------
 cleanup() {
-    # First, try graceful termination
     kill -TERM -- -$$ 2>/dev/null
-    
-    # Wait briefly for processes to clean up
     sleep 0.5
-    
-    # Force kill any remaining processes
     kill -KILL -- -$$ 2>/dev/null
-    
-    exit 130  # Standard exit code for script terminated by signal
+    [ -f "$HOME/delorean_error_check.tmp" ] && rm "$HOME/delorean_error_check.tmp"
+    exit 130
 }
-
 trap cleanup SIGINT SIGTERM
- 
-# Backup scheduling parameters
+
+# ----------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------
 scheduledBackupTime="8:10"
 rangeStart="07:00"
 rangeEnd="21:00"
-# How often the app should check if an rsync happened that day in seconds (3600 seconds = 1 hour)
 frequencyCheck="3600"
 maxDayAttemptNotification=6
- 
+
 # Define source directories
 SOURCES=("$HOME/Pictures" "$HOME/Documents" "$HOME/Downloads" "$HOME/Desktop")
-#SOURCES=("$HOME/Documents" "$HOME/Downloads" "$HOME/Pictures")
-#SOURCES=("$HOME/Pictures" "$HOME/Downloads")
- 
+
 # Define destination directory
 DEST="/Volumes/SFA-All/User Data/$(whoami)/"
-mkdir -p "$DEST" # Create destination directory if it doesn't exist
- 
-# Log file
+# DEST="/Volumes/$(whoami)/SYSTEM/delorean/"
+mkdir -p "$DEST"
+
+# Log files
 LOG_FILE="$HOME/delorean.log"
-mkdir -p "$(dirname "$LOG_FILE")" # Create log file directory if it doesn't exist
- 
-# Function to log a failure with rsync exit code
-log_failure_with_code() {
-    local exit_code=$1
-    local error_desc=""
-    
-    case $exit_code in
-        1) error_desc="Configuration or syntax error" ;;
-        3) error_desc="File access error (permissions or file in use)" ;;
-        10) error_desc="Network connection error" ;;
-        11) error_desc="File I/O error (disk full or file locked)" ;;
-        12) error_desc="Data corruption during transfer" ;;
-        23) error_desc="Transfer incomplete due to errors" ;;
-        24) error_desc="Source file was deleted during backup" ;;
-        30) error_desc="Network timeout" ;;
-        *) error_desc="Unknown error (code $exit_code)" ;;
-    esac
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Backup Failed: $error_desc (exit code: $exit_code)" >> "$LOG_FILE"
+mkdir -p "$(dirname "$LOG_FILE")"
+ERROR_TEMP="$HOME/delorean_error_check.tmp"
+# Clean up any leftover temp file from previous interrupted run
+[ -f "$ERROR_TEMP" ] && rm "$ERROR_TEMP"
+
+# ----------------------------------------------------------------------
+# RSYNC OPTIONS & EXCLUDES
+# ----------------------------------------------------------------------
+# Using -rltD instead of --archive to avoid permission/ownership issues on NTFS
+# --inplace: Write directly to destination (avoids temp file length issues)
+# --no-p/o/g: Don't try to preserve permissions/owner/group (NTFS compatibility)
+OPTIONS=(-rltD --inplace --verbose --partial --progress --stats --delete --no-p --no-o --no-g)
+
+EXCLUDES=(
+    --exclude='Photos Library.photoslibrary'
+    --exclude='.DS_Store'
+    --exclude='~$*'
+    --exclude='*.download'
+    --exclude='*.crdownload'
+    --exclude='*.part'
+    --exclude='*.icloud'
+    --exclude='*-shm'
+    --exclude='*-wal'
+    --exclude='*.tmp'
+    --exclude='*.wav'
+    --exclude='*.aup3'
+    --exclude='*.mp3'
+    --exclude='*.m4a'
+    --exclude='*.mp4'
+    --exclude='*.dmg'
+    --exclude='*.pkg'
+    --exclude='*.iso'
+    --exclude='*.jpg'
+    --exclude='*.mov'
+)
+
+# ----------------------------------------------------------------------
+# LOGGING FUNCTIONS
+# ----------------------------------------------------------------------
+log_entry() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
- 
-# Function to log a successful backup
+
 log_success() {
-    # Check if this was triggered by manual or scheduled backup
-    # We'll pass this as an environment variable from Swift
     local backup_type="${BACKUP_TYPE:-scheduled}"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Backup completed successfully ($backup_type)" >> "$LOG_FILE"
+    log_entry "Backup completed successfully ($backup_type)"
 }
- 
-# Rsync options and excludes as arrays
-OPTIONS=(--archive --verbose --partial --progress --stats --delete)
-EXCLUDES=(--exclude='Pictures/Photos Library.photoslibrary' --exclude='.DS_Store')
- 
-# Run single rsync command for all sources at once
-rsync "${OPTIONS[@]}" "${EXCLUDES[@]}" "${SOURCES[@]}" "$DEST"
+
+# ----------------------------------------------------------------------
+# EXECUTION
+# ----------------------------------------------------------------------
+# Run rsync, capturing ALL output to temp file for analysis
+rsync "${OPTIONS[@]}" "${EXCLUDES[@]}" "${SOURCES[@]}" "$DEST" > "$ERROR_TEMP" 2>&1
 rsync_exit_code=$?
 
-# Log result based on exit code
+# Extract ONLY errors/warnings to main log (prevents bloat)
+# ": open$" matches rsync's "filename: open" error at end of line only
+grep -E "mkstempat|File name too long|Operation not permitted|: open$" "$ERROR_TEMP" | grep -v "rsync_downloader\|rsync_receiver\|rsync_sender\|io_read\|unexpected end of file\|child.*exited" >> "$LOG_FILE" 2>/dev/null || true
+
+# ----------------------------------------------------------------------
+# INTELLIGENT ERROR HANDLING
+# ----------------------------------------------------------------------
 if [ $rsync_exit_code -eq 0 ]; then
+    # Perfect success
     log_success
-    # Copy log file to destination on success
+    rm "$ERROR_TEMP"
     cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
     echo "Backup completed."
     exit 0
+
+elif [ $rsync_exit_code -eq 23 ] || [ $rsync_exit_code -eq 24 ]; then
+    # Partial failure - check if errors are tolerable
+    # 23 = Partial transfer due to error
+    # 24 = Source files vanished during backup
+    if grep -qE "mkstempat|File name too long|Input/output error|Operation not permitted|vanished|: open$" "$ERROR_TEMP"; then
+        # Tolerable errors: filesystem can't store certain filenames, or files disappeared
+        # Log success first (for "Last Backup" display)
+        log_success
+        # Then log the warning details
+        log_entry "Warning: Some files could not be backed up due to filesystem limitations"
+        # Extract and log problematic filenames
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Files that could not be backed up:" >> "$LOG_FILE"
+        grep -E "mkstempat|File name too long|: open$" "$ERROR_TEMP" | grep -oE "(Downloads|Documents|Pictures|Desktop)/[^:]*" | head -20 >> "$LOG_FILE"
+        rm "$ERROR_TEMP"
+        cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
+        # Always notify on warnings (both manual and scheduled)
+        echo "Backup completed with warnings."
+        exit 2
+    else
+        # Real partial failure (network timeout, disk issues, etc.)
+        log_entry "Backup Failed: Partial transfer with critical errors (exit code: $rsync_exit_code)"
+        rm "$ERROR_TEMP"
+        cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
+        echo "Backup failed."
+        exit $rsync_exit_code
+    fi
+
+elif [ $rsync_exit_code -eq 1 ]; then
+    # Exit code 1 - check if it's just filename issues
+    if grep -qE "mkstempat|File name too long|Input/output error|Operation not permitted|: open$" "$ERROR_TEMP"; then
+        # Just filename problems, treat as success with warnings
+        # Log success first (for "Last Backup" display)
+        log_success
+        # Then log the warning details
+        log_entry "Warning: Some files could not be backed up due to filesystem limitations"
+        # Extract and log problematic filenames
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Files that could not be backed up:" >> "$LOG_FILE"
+        grep -E "mkstempat|File name too long|: open$" "$ERROR_TEMP" | grep -oE "(Downloads|Documents|Pictures|Desktop)/[^:]*" | head -20 >> "$LOG_FILE"
+        rm "$ERROR_TEMP"
+        cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
+        # Always notify on warnings (both manual and scheduled)
+        echo "Backup completed with warnings."
+        exit 2
+    else
+        # Real configuration/syntax error
+        log_entry "Backup Failed: Configuration or syntax error (exit code: 1)"
+        rm "$ERROR_TEMP"
+        cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
+        echo "Backup failed."
+        exit 1
+    fi
+
 else
-    log_failure_with_code $rsync_exit_code
-    # Try to copy log file even on failure (might not work if network is down)
+    # Catastrophic failures - provide specific error messages
+    case $rsync_exit_code in
+        10)
+            log_entry "Backup Failed: Network connection error (exit code: 10)"
+            ;;
+        # Check if it's specifically a disk full error
+        11) 
+            if grep -q "No space left on device" "$ERROR_TEMP"; then
+                log_entry "Backup Failed: Network drive is full (exit code: 11)"
+            else
+                log_entry "Backup Failed: File I/O error (exit code: 11)"
+            fi
+            ;;
+        12)
+            log_entry "Backup Failed: Data stream error (exit code: 12)"
+            ;;
+        30)
+            log_entry "Backup Failed: Network timeout (exit code: 30)"
+            ;;
+        *)
+            log_entry "Backup Failed: Critical error (exit code: $rsync_exit_code)"
+            ;;
+    esac
+    rm "$ERROR_TEMP"
     cp "$LOG_FILE" "$DEST/delorean.log" 2>/dev/null || true
     echo "Backup failed."
-    exit $rsync_exit_code  # Exit with the actual rsync error code
+    exit $rsync_exit_code
 fi
